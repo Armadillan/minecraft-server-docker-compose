@@ -8,6 +8,10 @@
 x-images:
   minecraft: &minecraft-image ${MINECRAFT_SERVER_IMAGE_TAG:-itzg/minecraft-server:${MINECRAFT_SERVER_IMAGE_VERSION:-2026.10.0@sha256:5a2ab74ae179c11e2dbbce67f307cdcf2c1257b3abb0f654d3a310b3d8ea57da}}
   mc-backup: &mc-backup-image ${MINECRAFT_SERVER_BACKUP_IMAGE_TAG:-itzg/mc-backup:${MINECRAFT_SERVER_BACKUP_IMAGE_VERSION:-2026.10.1@sha256:c5f2c369bbe47d0b712601bf44af5927e67a18cb5816dc378efb45eb993dab0a}}
+  mc-router: &mc-router-image ${MINECRAFT_SERVER_ROUTER_IMAGE_TAG:-itzg/mc-router:${MINECRAFT_SERVER_ROUTER_IMAGE_VERSION:-1.49.0@sha256:76697861c41e7d64880accf0d25e953a3c2d871e6f5f0922d7c830ffcb2b75ab}}
+  socket-proxy: &socket-proxy-image ${MINECRAFT_SERVER_SOCKET_PROXY_IMAGE_TAG:-tecnativa/docker-socket-proxy:${MINECRAFT_SERVER_SOCKET_PROXY_IMAGE_VERSION:-v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459}}
+  backup-watcher: &backup-watcher-image ${MINECRAFT_SERVER_BACKUP_WATCHER_IMAGE_TAG:-busybox:${MINECRAFT_SERVER_BACKUP_WATCHER_IMAGE_VERSION:-1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e}}
+  admin-panel: &admin-panel-image ${MINECRAFT_SERVER_ADMIN_PANEL_IMAGE_TAG:-python:${MINECRAFT_SERVER_ADMIN_PANEL_IMAGE_VERSION:-3.13-slim@sha256:d98cc29d3266e535dd9da1099688d9cb3ca4753813571e071763d17725460962}}
 
 networks:
   minecraft-server-network:
@@ -69,11 +73,116 @@ services:
       WHITELIST: ${MINECRAFT_SERVER_WHITELIST:-}
       OPS: ${MINECRAFT_SERVER_OPS:-}
       TZ: ${MINECRAFT_SERVER_SERVER_TIMEZONE:-UTC}
+    labels:
+      # Scale-to-zero: mc-router discovers this container through the Docker
+      # socket, routes the hostname below to it, starts it on first join,
+      # and stops it again after the idle timeout. The server no longer
+      # publishes any port; the router is the only published service.
+      mc-router.host: ${MINECRAFT_SERVER_ROUTER_HOST:-mc.example.com}
+      mc-router.port: "${MINECRAFT_SERVER_SERVER_PORT:-25565}"
     networks:
       - minecraft-server-network
-    ports:
-      - "${MINECRAFT_SERVER_SERVER_PORT:-25565}:${MINECRAFT_SERVER_SERVER_PORT:-25565}"
     restart: unless-stopped
+
+  socket-proxy:
+    image: *socket-proxy-image
+    # The only container in the stack that holds /var/run/docker.sock. It
+    # fronts a filtered subset of the Docker API over plain HTTP on the
+    # compose network (no published ports), so the router and the backup
+    # watcher never hold the socket themselves. The Docker socket is
+    # root-equivalent on the host; this is the wall between that and the
+    # internet-facing router.
+    #
+    # The image runs as root by design (USER root in its Dockerfile): it must
+    # dial the host socket, whose group varies by host (999 native install,
+    # 0 on Docker Desktop). Root plus no published ports plus dropped
+    # capabilities confines it to the compose network.
+    security_opt:
+      - no-new-privileges:true
+    # Drop every Linux capability; HAProxy needs none to proxy the socket.
+    cap_drop:
+      - ALL
+    # Resource limits as .env-overridable defaults (e.g. MINECRAFT_SERVER_SOCKET_PROXY_MEMORY_LIMIT=64m);
+    # the override survives every git pull.
+    deploy:
+      resources:
+        limits:
+          memory: ${MINECRAFT_SERVER_SOCKET_PROXY_MEMORY_LIMIT:-32m}
+          cpus: "${MINECRAFT_SERVER_SOCKET_PROXY_CPU_LIMIT:-0.25}"
+        reservations:
+          memory: ${MINECRAFT_SERVER_SOCKET_PROXY_MEMORY_RESERVATION:-8m}
+          cpus: "${MINECRAFT_SERVER_SOCKET_PROXY_CPU_RESERVATION:-0.05}"
+    environment:
+      # Least-privilege allow-list for this stack (everything else answers
+      # 403). EVENTS, PING and VERSION are allowed by the image's defaults.
+      #   router:         list/inspect containers, start/stop/unpause, events
+      #   backup-watcher: list containers (read-only)
+      # The itzg reference uses the broader POST: 1 + NETWORKS: 1; the
+      # fine-grained ALLOW_* flags below are the same surface, minus the
+      # container actions nobody here needs (kill, rename, pause, ...).
+      CONTAINERS: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      ALLOW_UNPAUSE: 1
+    # The proxy dials the socket; ":ro" does not restrict the API (it is a
+    # request/response protocol), it only keeps the socket file itself intact.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - minecraft-server-network
+    restart: unless-stopped
+
+  router:
+    image: *mc-router-image
+    # Hardening: no privilege escalation via setuid binaries
+    security_opt:
+      - no-new-privileges:true
+    # Drop every Linux capability; the router needs none. It binds :25565,
+    # above the privileged port range, and reaches the Docker daemon through
+    # the socket proxy over the compose network - no setuid, no raw sockets,
+    # no capability calls, no socket of its own.
+    cap_drop:
+      - ALL
+    # Resource limits as .env-overridable defaults (e.g. MINECRAFT_SERVER_ROUTER_MEMORY_LIMIT=128m);
+    # the override survives every git pull.
+    deploy:
+      resources:
+        limits:
+          memory: ${MINECRAFT_SERVER_ROUTER_MEMORY_LIMIT:-64m}
+          cpus: "${MINECRAFT_SERVER_ROUTER_CPU_LIMIT:-0.25}"
+        reservations:
+          memory: ${MINECRAFT_SERVER_ROUTER_MEMORY_RESERVATION:-16m}
+          cpus: "${MINECRAFT_SERVER_ROUTER_CPU_RESERVATION:-0.05}"
+    environment:
+      # Service discovery and start/stop of the backend containers through
+      # the Docker daemon - via the socket proxy, the only container in the
+      # stack that holds /var/run/docker.sock itself. With IN_DOCKER set, the
+      # router watches the container event stream for the mc-router.* labels
+      # instead of a static MAPPING.
+      IN_DOCKER: "true"
+      DOCKER_SOCKET: "tcp://socket-proxy:2375"
+      # Scale from zero: start the server container when a player joins.
+      AUTO_SCALE_UP: ${MINECRAFT_SERVER_ROUTER_AUTO_SCALE_UP:-true}
+      # Scale to zero: stop the server container after this long with no
+      # players connected. The stop is graceful, so Paper flushes the world
+      # on the way down - sleeping loses nothing.
+      AUTO_SCALE_DOWN: ${MINECRAFT_SERVER_ROUTER_AUTO_SCALE_DOWN:-true}
+      AUTO_SCALE_DOWN_AFTER: ${MINECRAFT_SERVER_ROUTER_AUTO_SCALE_DOWN_AFTER:-2h}
+      # What a client sees while the server is asleep / waking up.
+      AUTO_SCALE_ASLEEP_MOTD: ${MINECRAFT_SERVER_ROUTER_AUTO_SCALE_ASLEEP_MOTD:-Server is asleep. Join again to wake it up!}
+      AUTO_SCALE_LOADING_MOTD: ${MINECRAFT_SERVER_ROUTER_AUTO_SCALE_LOADING_MOTD:-Server is waking up, hold on}
+      TZ: ${MINECRAFT_SERVER_SERVER_TIMEZONE:-UTC}
+    networks:
+      - minecraft-server-network
+    # The only published port in the stack: players reach the server through
+    # the router, and only through the router. It refuses connections that
+    # do not name a mapped hostname, so port scanners cannot wake the server.
+    ports:
+      - "${MINECRAFT_SERVER_SERVER_PORT:-25565}:25565"
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+      - minecraft-server
 
   backups:
     image: *mc-backup-image
@@ -111,7 +220,11 @@ services:
       SRC_DIR: ${DATA_PATH:-/data}
       BACKUP_METHOD: ${BACKUP_METHOD:-tar}
       BACKUP_INTERVAL: ${MINECRAFT_SERVER_BACKUP_INTERVAL:-23h}
-      PRUNE_BACKUPS_DAYS: ${MINECRAFT_SERVER_PRUNE_BACKUPS_DAYS:-7}
+      # Set far out on purpose: the backup-watcher enforces the joint
+      # retention policy (2 per day x 3 days) across both backup triggers, so
+      # this stays a safety net only. It still logs its prune line, which the
+      # e2e test asserts on.
+      PRUNE_BACKUPS_DAYS: ${MINECRAFT_SERVER_PRUNE_BACKUPS_DAYS:-3650}
       INITIAL_DELAY: ${MINECRAFT_SERVER_INITIAL_DELAY:-0}
       # A BACKUP ON A CLOCK, NOT ON AN UPTIME. The interval counts from the
       # sidecar's start, so the backup window lands wherever the last restart
@@ -132,3 +245,112 @@ services:
     depends_on:
       minecraft-server:
         condition: service_healthy
+
+  backup-watcher:
+    image: *backup-watcher-image
+    # A tiny busybox loop, scripted in scripts/shutdown-backup.sh, that
+    # (a) watches the server container's state through the socket proxy and
+    # tars the world when it sees running -> stopped (the router's scale-down
+    # just flushed it to disk, and RCON is gone, so the sidecar cannot do it),
+    # and (b) enforces the joint retention policy on BOTH backup triggers:
+    # at most 2 archives per calendar day (newest kept) across at most 3
+    # distinct days (newest kept).
+    security_opt:
+      - no-new-privileges:true
+    # Drop every Linux capability; the watcher tars a read-only mount and
+    # makes one HTTP request per poll - it needs none.
+    cap_drop:
+      - ALL
+    # Resource limits as .env-overridable defaults (e.g. MINECRAFT_SERVER_BACKUP_WATCHER_MEMORY_LIMIT=256m);
+    # the override survives every git pull.
+    deploy:
+      resources:
+        limits:
+          memory: ${MINECRAFT_SERVER_BACKUP_WATCHER_MEMORY_LIMIT:-128m}
+          cpus: "${MINECRAFT_SERVER_BACKUP_WATCHER_CPU_LIMIT:-0.5}"
+        reservations:
+          memory: ${MINECRAFT_SERVER_BACKUP_WATCHER_MEMORY_RESERVATION:-16m}
+          cpus: "${MINECRAFT_SERVER_BACKUP_WATCHER_CPU_RESERVATION:-0.1}"
+    environment:
+      # Same zone as the sidecar, so both triggers' archive timestamps fall
+      # on the same calendar days for the joint retention.
+      TZ: ${MINECRAFT_SERVER_SERVER_TIMEZONE:-UTC}
+      WATCHER_PROXY_URL: "http://socket-proxy:2375"
+      WATCHER_POLL_INTERVAL: ${MINECRAFT_SERVER_BACKUP_WATCHER_POLL_INTERVAL:-60}
+      WATCHER_MAX_PER_DAY: ${MINECRAFT_SERVER_BACKUP_WATCHER_MAX_PER_DAY:-2}
+      WATCHER_MAX_DAYS: ${MINECRAFT_SERVER_BACKUP_WATCHER_MAX_DAYS:-3}
+    volumes:
+      - ./scripts/shutdown-backup.sh:/watcher.sh:ro
+      # The world, read-only: the watcher only ever reads it.
+      - ./minecraft-server-data:${DATA_PATH:-/data}:ro
+      # The shared archive directory: shutdown archives land here next to the
+      # sidecar's, under one retention policy.
+      - ./minecraft-server-data-backups:${MINECRAFT_SERVER_BACKUPS_PATH:-/backups}
+      # busybox has no zoneinfo; the host's table lets the archive timestamps
+      # match the sidecar's calendar days. Standard on every distro.
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro
+    entrypoint:
+      - /bin/sh
+      - /watcher.sh
+    networks:
+      - minecraft-server-network
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+
+  admin-panel:
+    image: *admin-panel-image
+    # A single standard-library Python script (scripts/admin-panel.py): a web
+    # UI on loopback that lists the online players, executes in-game
+    # commands through RCON, and mirrors the server's console - player chat
+    # plus system lines - by following latest.log in the read-only data
+    # mount. It never wakes the server: with the server stopped, its RCON
+    # dial is refused and the UI simply reports the server offline. It
+    # holds no Docker socket and publishes no port but 127.0.0.1.
+    security_opt:
+      - no-new-privileges:true
+    # Drop every Linux capability; it binds :8080 (above the privileged
+    # port range), dials RCON, and reads a read-only mount - it needs none.
+    # The image runs as root by default, which is what lets it read the
+    # server's log files whatever uid the server container wrote them as.
+    cap_drop:
+      - ALL
+    # Resource limits as .env-overridable defaults (e.g. MINECRAFT_SERVER_ADMIN_PANEL_MEMORY_LIMIT=96m);
+    # the override survives every git pull.
+    deploy:
+      resources:
+        limits:
+          memory: ${MINECRAFT_SERVER_ADMIN_PANEL_MEMORY_LIMIT:-96m}
+          cpus: "${MINECRAFT_SERVER_ADMIN_PANEL_CPU_LIMIT:-0.25}"
+        reservations:
+          memory: ${MINECRAFT_SERVER_ADMIN_PANEL_MEMORY_RESERVATION:-32m}
+          cpus: "${MINECRAFT_SERVER_ADMIN_PANEL_CPU_RESERVATION:-0.05}"
+    environment:
+      TZ: ${MINECRAFT_SERVER_SERVER_TIMEZONE:-UTC}
+      # The port the panel listens on; published below on 127.0.0.1 only.
+      PANEL_PORT: ${MINECRAFT_SERVER_ADMIN_PANEL_PORT:-8080}
+      # Optional shared token: when set, the UI asks for it once (kept in
+      # the browser session) and every request must carry it.
+      PANEL_TOKEN: ${MINECRAFT_SERVER_ADMIN_PANEL_TOKEN:-}
+      # RCON to the server, the same wiring as the backups sidecar.
+      RCON_HOST: minecraft-server
+      RCON_PORT: ${MINECRAFT_SERVER_RCON_PORT:-25575}
+      RCON_PASSWORD: ${MINECRAFT_SERVER_RCON_PASSWORD}
+      DATA_PATH: ${DATA_PATH:-/data}
+    volumes:
+      - ./scripts/admin-panel.py:/panel.py:ro
+      # The world, read-only: the panel only ever reads its log.
+      - ./minecraft-server-data:${DATA_PATH:-/data}:ro
+    entrypoint:
+      - python
+      - /panel.py
+    networks:
+      - minecraft-server-network
+    # Loopback only on the host: the UI is for the person at this machine,
+    # or an SSH tunnel away. Remote access is a tunnel, not a published
+    # port.
+    ports:
+      - "127.0.0.1:${MINECRAFT_SERVER_ADMIN_PANEL_PORT:-8080}:${MINECRAFT_SERVER_ADMIN_PANEL_PORT:-8080}"
+    restart: unless-stopped
+    depends_on:
+      - minecraft-server

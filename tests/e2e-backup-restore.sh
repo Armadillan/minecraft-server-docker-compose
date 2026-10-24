@@ -3,6 +3,11 @@
 #
 # Requires: docker, docker compose. Assumes the stack is already up with a
 # short backup interval in .env (CI uses INITIAL_DELAY=15s, INTERVAL=60s).
+# Also raise the backup watcher's retention for the run, or it will prune
+# the test's high-frequency archives mid-run (CI does this in its ephemeral
+# .env; locally set in .env before up):
+#   MINECRAFT_SERVER_BACKUP_WATCHER_MAX_PER_DAY=1000
+#   MINECRAFT_SERVER_BACKUP_WATCHER_MAX_DAYS=365
 #
 # Run from the repository root:
 #   ./tests/e2e-backup-restore.sh

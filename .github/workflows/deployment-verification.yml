@@ -58,6 +58,14 @@ jobs:
             env_var: MINECRAFT_SERVER_IMAGE_TAG
           - name: mc-backup
             env_var: MINECRAFT_SERVER_BACKUP_IMAGE_TAG
+          - name: mc-router
+            env_var: MINECRAFT_SERVER_ROUTER_IMAGE_TAG
+          - name: docker-socket-proxy
+            env_var: MINECRAFT_SERVER_SOCKET_PROXY_IMAGE_TAG
+          - name: backup-watcher
+            env_var: MINECRAFT_SERVER_BACKUP_WATCHER_IMAGE_TAG
+          - name: admin-panel
+            env_var: MINECRAFT_SERVER_ADMIN_PANEL_IMAGE_TAG
 
     steps:
       - name: Checkout repository
@@ -121,13 +129,23 @@ jobs:
         # the compose x-images defaults apply, so CI tests exactly the pins
         # the template ships. EULA=true here accepts the Minecraft EULA for
         # this ephemeral CI run. INITIAL_DELAY is shortened so the backup
-        # smoke completes inside the job.
+        # smoke completes inside the job. AUTO_SCALE_DOWN is off for the same
+        # reason: the smoke window outlasts any idle timeout, and a router
+        # that stops the server mid-run would read as a broken stack. The
+        # watcher's retention is raised so it cannot prune the e2e test's
+        # high-frequency archives.
         run: |
           cat > .env <<EOF
           MINECRAFT_SERVER_RCON_PASSWORD=$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)
           MINECRAFT_SERVER_EULA=true
           MINECRAFT_SERVER_INITIAL_DELAY=15s
           MINECRAFT_SERVER_BACKUP_INTERVAL=60s
+          MINECRAFT_SERVER_ROUTER_AUTO_SCALE_DOWN=false
+          MINECRAFT_SERVER_ROUTER_HOST=localhost
+          MINECRAFT_SERVER_BACKUP_WATCHER_MAX_PER_DAY=1000
+          MINECRAFT_SERVER_BACKUP_WATCHER_MAX_DAYS=365
+          # Off the default 8080, which a shared runner may already hold.
+          MINECRAFT_SERVER_ADMIN_PANEL_PORT=8899
           EOF
           echo "Generated ephemeral .env for CI run"
 
@@ -218,6 +236,26 @@ jobs:
         # the shipped RCON wiring works, not just that the port is open.
         run: |
           docker compose -f "$DOCKER_COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" exec -T minecraft-server rcon-cli list
+
+      - name: Verify the router answers on 25565
+        # The router is the only published service now, so "the server
+        # container is healthy" is not the same as "a client can reach a
+        # server". This speaks the first two packets of the Minecraft Java
+        # protocol (handshake, status request) to the published port and
+        # requires the JSON status response - the server's real status,
+        # proxied, since the server is up here.
+        run: |
+          chmod +x tests/mc-router-smoke.sh
+          ./tests/mc-router-smoke.sh
+
+      - name: Verify the admin panel answers
+        # The panel is published on loopback only, so CI reaches it through
+        # the runner's own 127.0.0.1. The server is up here, so /api/state
+        # must report it online with the RCON-backed player list, and the
+        # console feed must already carry the boot lines from latest.log.
+        run: |
+          curl -fsS http://127.0.0.1:8899/api/state | grep -q '"online":true'
+          curl -fsS 'http://127.0.0.1:8899/api/chat?after=-1' | grep -q '"entries":['
 
       - name: Verify a backup archive is produced
         run: |

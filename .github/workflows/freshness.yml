@@ -53,7 +53,7 @@ jobs:
       - name: Compare pinned digests against what each tag resolves to now
         run: |
           status=0
-          for var in MINECRAFT_SERVER_IMAGE_TAG MINECRAFT_SERVER_BACKUP_IMAGE_TAG; do
+          for var in MINECRAFT_SERVER_IMAGE_TAG MINECRAFT_SERVER_BACKUP_IMAGE_TAG MINECRAFT_SERVER_ROUTER_IMAGE_TAG MINECRAFT_SERVER_SOCKET_PROXY_IMAGE_TAG MINECRAFT_SERVER_BACKUP_WATCHER_IMAGE_TAG MINECRAFT_SERVER_ADMIN_PANEL_IMAGE_TAG; do
             pin="$(grep -m1 -oE "\\\$\\{${var}:-.*" minecraft-server-docker-compose.yml | sed -E -e ':a' -e 's/\$\{[A-Z0-9_]+:-([^{}]*)\}/\1/' -e 'ta')"
             ref="${pin%%@*}"
             pinned_digest="${pin##*@}"
@@ -113,4 +113,5 @@ jobs:
           }
           check MINECRAFT_SERVER_IMAGE_TAG itzg/docker-minecraft-server
           check MINECRAFT_SERVER_BACKUP_IMAGE_TAG itzg/docker-mc-backup
+          check MINECRAFT_SERVER_ROUTER_IMAGE_TAG itzg/mc-router
           exit "$status"
