@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_(no unreleased changes yet)_
+### Added
+
+- **Scale-to-zero with `itzg/mc-router`.** A pinned router service (`1.49.0@sha256:76697861…`) now fronts port 25565 and is the only externally-reachable published service in the stack. It routes the hostname in `MINECRAFT_SERVER_ROUTER_HOST` to the server container, starts the server on first join, and stops it again after `MINECRAFT_SERVER_ROUTER_AUTO_SCALE_DOWN_AFTER` (default 2h) without players — the stop is graceful, so Paper flushes the world on the way down. The server container no longer publishes any port.
+  - Until `MINECRAFT_SERVER_ROUTER_HOST` is set to a real hostname, the router refuses every connection and the server never wakes — an unconfigured deployment costs nothing.
+  - The scheduled backup only lands while the server is awake — the shutdown backup below covers the asleep windows. Point `CRON_SCHEDULE` at a time players are usually online.
+  - CI now scans the router image with Trivy, tracks its pin for digest and release drift, and verifies the router answers the Minecraft status protocol on 25565 (`tests/mc-router-smoke.sh`). Auto-scale-down is disabled in the ephemeral CI `.env` so the router never stops the server mid-smoke.
+
+- **Docker socket proxy.** The router no longer mounts `/var/run/docker.sock`. A pinned `tecnativa/docker-socket-proxy` container is now the only service that holds the socket; it fronts a least-privilege slice of the Docker API over the compose network (containers list/inspect, start/stop/unpause, default event stream - everything else 403) and runs with no published ports. The router points at it with `DOCKER_SOCKET: tcp://socket-proxy:2375`, and the host's docker group no longer needs configuring (`MINECRAFT_SERVER_ROUTER_DOCKER_GROUP` is gone).
+- **Shutdown backup + joint retention.** A pinned `busybox` watcher (`scripts/shutdown-backup.sh`) watches the server's state through the proxy and, on running → stopped, archives the just-flushed world as `world-<ts>-shutdown.tar.gz` - the scheduled backup cannot, because RCON is gone with the server. Both triggers' archives share one retention policy, enforced by the watcher: at most 2 archives per calendar day (newest kept) across at most 3 distinct days (newest kept). `mc-backup`'s age prune moves to 3650 days as a safety net so it never fights the policy. CI raises the watcher's limits so it cannot prune the e2e test's archives, and scans/pins the two new images.
+- **Admin panel.** A pinned `python:3.13-slim` service running one standard-library-only script (`scripts/admin-panel.py`): a web UI on `127.0.0.1:8080` (`MINECRAFT_SERVER_ADMIN_PANEL_PORT`) that lists the online players, executes in-game commands through RCON, and mirrors the server's console - player chat plus system lines - by following `logs/latest.log` in the read-only data mount. It never wakes the server: with the server stopped, its RCON dial is refused and the UI reports the server offline; it holds no Docker socket and no published port beyond loopback. An optional `MINECRAFT_SERVER_ADMIN_PANEL_TOKEN` gates the UI and its API behind a shared token. CI scans the image and verifies `/api/state` answers with the RCON-backed state and a console feed that already carries the boot lines.
 
 ## [1.7.3] - 2026-10-17
 
