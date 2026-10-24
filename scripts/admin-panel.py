@@ -673,32 +673,32 @@ class Handler(BaseHTTPRequestHandler):
         self._send_body(code, json.dumps(obj, separators=(",", ":")).encode(),
                         "application/json")
 
-def do_GET(self):
-    parts = urlsplit(self.path)
-
-    if parts.path in ("/", "/index.html"):
-        return self._send_body(
-            200,
-            build_page().encode(),
-            "text/html; charset=utf-8",
-        )
-
-    if not self._authorized():
-        return self._send_json(401, {"error": "missing or bad X-Panel-Token"})
-
-    if parts.path == "/api/state":
-        return self._send_json(200, self.state.snapshot())
-
-    if parts.path == "/api/chat":
-        qs = parse_qs(parts.query)
-        try:
-            after = int(qs.get("after", ["-1"])[0])
-        except ValueError:
-            after = -1
-        entries, latest = self.feed.entries_after(after)
-        return self._send_json(200, {"entries": entries, "latest": latest})
-
-    return self._send_json(404, {"error": "not found"})
+    def do_GET(self):
+        parts = urlsplit(self.path)
+    
+        if parts.path in ("/", "/index.html"):
+            return self._send_body(
+                200,
+                build_page().encode(),
+                "text/html; charset=utf-8",
+            )
+    
+        if not self._authorized():
+            return self._send_json(401, {"error": "missing or bad X-Panel-Token"})
+    
+        if parts.path == "/api/state":
+            return self._send_json(200, self.state.snapshot())
+    
+        if parts.path == "/api/chat":
+            qs = parse_qs(parts.query)
+            try:
+                after = int(qs.get("after", ["-1"])[0])
+            except ValueError:
+                after = -1
+            entries, latest = self.feed.entries_after(after)
+            return self._send_json(200, {"entries": entries, "latest": latest})
+    
+        return self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
         if not self._authorized():
