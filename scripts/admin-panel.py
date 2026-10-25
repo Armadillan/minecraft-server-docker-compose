@@ -178,11 +178,18 @@ class ServerState:
             self.updated = time.time()
 
 
-LIST_RE = re.compile(r"There are (\d+) of (\d+) max players online:(.*)")
+LIST_RE = re.compile(
+    r"There are (\d+) of (?:a )?max of? (\d+) players online:(.*)"
+)
 
 
 def parse_list_response(text):
-    """'There are 2 of 20 max players online: Steve, Alex' -> (names, max)."""
+    """Parse Paper's list response.
+
+    Examples:
+      There are 0 of 20 max players online:
+      There are 0 of a max of 20 players online:
+    """
     m = LIST_RE.search(text or "")
     if not m:
         return None
