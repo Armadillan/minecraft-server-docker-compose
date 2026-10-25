@@ -9,7 +9,7 @@ x-images:
   minecraft: &minecraft-image ${MINECRAFT_SERVER_IMAGE_TAG:-itzg/minecraft-server:${MINECRAFT_SERVER_IMAGE_VERSION:-2026.10.0@sha256:5a2ab74ae179c11e2dbbce67f307cdcf2c1257b3abb0f654d3a310b3d8ea57da}}
   mc-backup: &mc-backup-image ${MINECRAFT_SERVER_BACKUP_IMAGE_TAG:-itzg/mc-backup:${MINECRAFT_SERVER_BACKUP_IMAGE_VERSION:-2026.10.1@sha256:c5f2c369bbe47d0b712601bf44af5927e67a18cb5816dc378efb45eb993dab0a}}
   mc-router: &mc-router-image ${MINECRAFT_SERVER_ROUTER_IMAGE_TAG:-itzg/mc-router:${MINECRAFT_SERVER_ROUTER_IMAGE_VERSION:-1.49.0@sha256:76697861c41e7d64880accf0d25e953a3c2d871e6f5f0922d7c830ffcb2b75ab}}
-  socket-proxy: &socket-proxy-image ${MINECRAFT_SERVER_SOCKET_PROXY_IMAGE_TAG:-tecnativa/docker-socket-proxy:${MINECRAFT_SERVER_SOCKET_PROXY_IMAGE_VERSION:-v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459}}
+  socket-proxy: &socket-proxy-image ${MINECRAFT_SERVER_SOCKET_PROXY_IMAGE_TAG:-linuxserver/socket-proxy:${MINECRAFT_SERVER_SOCKET_PROXY_IMAGE_VERSION:-version-3.4.7-r0@sha256:e5d819de59b343c01b2fe7adc7fad3c7a60e5dba08e45f1ac317352bc08599b5}}
   backup-watcher: &backup-watcher-image ${MINECRAFT_SERVER_BACKUP_WATCHER_IMAGE_TAG:-busybox:${MINECRAFT_SERVER_BACKUP_WATCHER_IMAGE_VERSION:-1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e}}
   admin-panel: &admin-panel-image ${MINECRAFT_SERVER_ADMIN_PANEL_IMAGE_TAG:-python:${MINECRAFT_SERVER_ADMIN_PANEL_IMAGE_VERSION:-3.13-slim@sha256:d98cc29d3266e535dd9da1099688d9cb3ca4753813571e071763d17725460962}}
 
@@ -117,10 +117,10 @@ services:
       # 403). EVENTS, PING and VERSION are allowed by the image's defaults.
       #   router:         list/inspect containers, start/stop/unpause, events
       #   backup-watcher: list containers (read-only)
-      # The itzg reference uses the broader POST: 1 + NETWORKS: 1; the
-      # fine-grained ALLOW_* flags below are the same surface, minus the
-      # container actions nobody here needs (kill, rename, pause, ...).
+      # LinuxServer's proxy keeps these ALLOW_* actions working with POST=0, so
+      # the router gets only start/stop/unpause instead of broad POST access.
       CONTAINERS: 1
+      POST: 0
       ALLOW_START: 1
       ALLOW_STOP: 1
       ALLOW_UNPAUSE: 1
