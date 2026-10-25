@@ -50,6 +50,8 @@ SEED_BYTES = 256 * 1024      # how much of an existing log to read at start
 COMMAND_MAX_LENGTH = 1000    # RCON commands are short; keep them short
 CONNECT_TIMEOUT = 10         # seconds, dialing the server container
 COMMAND_TIMEOUT = 60         # seconds, waiting for a command's response
+MAX_RCON_PACKET_SIZE = 4 * 1024 * 1024
+MAX_REQUEST_BODY_BYTES = 16 * 1024
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,25 +107,46 @@ class Rcon:
             payload = payload[:-2]
         return pkt_type, pkt_id, payload.decode("utf-8", "replace")
 
-    def connect(self):
-        sock = socket.create_connection((RCON_HOST, RCON_PORT), timeout=CONNECT_TIMEOUT)
-        sock.settimeout(CONNECT_TIMEOUT)
-        pkt_id = self._alloc_id()
-        sock.sendall(self._pack(pkt_id, 3, RCON_PASSWORD))
-        size = struct.unpack("<i", self._recv_exact(sock, 4))[0]
-        _, rid, _ = self._unpack(self._recv_exact(sock, size))
-        if rid == -1:
-            sock.close()
-            raise RconError("RCON login rejected (bad password?)")
-        self._sock = sock
+    @classmethod
+    def _recv_packet(cls, sock):
+        size = struct.unpack("<i", cls._recv_exact(sock, 4))[0]
+        if size < 10 or size > MAX_RCON_PACKET_SIZE:
+            raise RconError("invalid RCON packet size")
+        return cls._unpack(cls._recv_exact(sock, size))
 
-    def close(self):
+    def connect(self):
+        with self._lock:
+            self._close_unlocked()
+            sock = socket.create_connection((RCON_HOST, RCON_PORT), timeout=CONNECT_TIMEOUT)
+            try:
+                sock.settimeout(CONNECT_TIMEOUT)
+                pkt_id = self._alloc_id()
+                sock.sendall(self._pack(pkt_id, 3, RCON_PASSWORD))
+                # Source/Paper commonly sends an empty RESPONSE_VALUE packet
+                # before AUTH_RESPONSE. Wait for AUTH_RESPONSE with our id.
+                for _ in range(4):
+                    pkt_type, rid, _ = self._recv_packet(sock)
+                    if rid == -1:
+                        raise RconError("RCON login rejected (bad password?)")
+                    if pkt_type == 2 and rid == pkt_id:
+                        self._sock = sock
+                        return
+                raise RconError("RCON auth handshake failed")
+            except Exception:
+                sock.close()
+                raise
+
+    def _close_unlocked(self):
         sock, self._sock = self._sock, None
         if sock is not None:
             try:
                 sock.close()
             except OSError:
                 pass
+
+    def close(self):
+        with self._lock:
+            self._close_unlocked()
 
     def command(self, line):
         """Send one command and return the server's response text."""
@@ -132,12 +155,18 @@ class Rcon:
                 raise RconError("not connected")
             self._sock.settimeout(COMMAND_TIMEOUT)
             pkt_id = self._alloc_id()
+            end_id = self._alloc_id()
             self._sock.sendall(self._pack(pkt_id, 2, line))
-            size = struct.unpack("<i", self._recv_exact(self._sock, 4))[0]
-            _, rid, payload = self._unpack(self._recv_exact(self._sock, size))
-            if rid == -1:
-                raise RconError(payload or "command rejected by the server")
-            return payload
+            self._sock.sendall(self._pack(end_id, 2, ""))
+            chunks = []
+            while True:
+                _, rid, payload = self._recv_packet(self._sock)
+                if rid == -1:
+                    raise RconError(payload or "command rejected by the server")
+                if rid == end_id:
+                    return "".join(chunks)
+                if rid == pkt_id:
+                    chunks.append(payload)
 
 
 class ServerState:
@@ -147,6 +176,7 @@ class ServerState:
         self._lock = threading.Lock()
         self.online = False
         self.players = []
+        self.player_count = 0
         self.max_players = 0
         self.last_error = ""
         self.updated = 0.0
@@ -156,7 +186,7 @@ class ServerState:
             return {
                 "online": self.online,
                 "players": list(self.players),
-                "player_count": len(self.players),
+                "player_count": self.player_count,
                 "max_players": self.max_players,
                 "last_error": self.last_error,
                 "updated": self.updated,
@@ -166,20 +196,29 @@ class ServerState:
         with self._lock:
             self.online = False
             self.players = []
+            self.player_count = 0
             self.last_error = error
             self.updated = time.time()
 
-    def set_players(self, names, max_players):
+    def set_players(self, names, player_count, max_players):
         with self._lock:
             self.online = True
             self.players = names
+            self.player_count = player_count
             self.max_players = max_players
             self.last_error = ""
             self.updated = time.time()
 
 
 LIST_RE = re.compile(
-    r"There are (\d+) of (?:a )?max of? (\d+) players online:(.*)"
+    r"There\s+(?:are|is)\s+"
+    r"(?P<count>\d+)\s*"
+    r"(?:"
+    r"of\s+(?:(?:a\s+)?max(?:\s+of)?\s+)?(?P<max_of>\d+)(?:\s+max)?"
+    r"|/\s*(?P<max_slash>\d+)"
+    r")\s+"
+    r"player(?:s)?\s+online\s*:?\s*(?P<tail>.*)",
+    re.IGNORECASE,
 )
 
 
@@ -189,12 +228,17 @@ def parse_list_response(text):
     Examples:
       There are 0 of 20 max players online:
       There are 0 of a max of 20 players online:
+      There are 0/20 players online:
     """
     m = LIST_RE.search(text or "")
     if not m:
         return None
-    names = [n.strip() for n in m.group(3).split(",") if n.strip()]
-    return names, int(m.group(2))
+    count = int(m.group("count"))
+    max_players = int(m.group("max_of") or m.group("max_slash"))
+    names = [n.strip() for n in m.group("tail").split(",") if n.strip()]
+    if count == 0:
+        names = []
+    return {"players": names, "player_count": count, "max_players": max_players}
 
 
 class RconWorker(threading.Thread):
@@ -212,9 +256,13 @@ class RconWorker(threading.Thread):
 
     def _refresh(self):
         parsed = parse_list_response(self.rcon.command("list"))
-        if parsed is not None:
-            self.state.set_players(*parsed)
-        # Online but the list did not parse: keep the last known list.
+        if parsed is None:
+            raise RconError("unrecognized response to 'list'")
+        self.state.set_players(
+            parsed["players"],
+            parsed["player_count"],
+            parsed["max_players"],
+        )
 
     def run(self):
         backoff = 5.0
@@ -389,6 +437,7 @@ header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   border: 1px solid var(--border); color: var(--dim); }
 .pill.online { color: var(--green); border-color: var(--green); }
 .pill.offline { color: var(--red); border-color: var(--red); }
+#state-error { margin-left: auto; margin-top: 0; }
 main { display: grid; grid-template-columns: 320px 1fr; gap: 14px;
   padding: 14px 18px; align-items: start; }
 @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
@@ -436,6 +485,7 @@ main { display: grid; grid-template-columns: 320px 1fr; gap: 14px;
 <header>
   <h1>Minecraft Admin</h1>
   <span id="status" class="pill">checking&hellip;</span>
+  <span id="state-error" class="hint" aria-live="polite"></span>
 </header>
 <main>
   <div>
@@ -447,11 +497,11 @@ main { display: grid; grid-template-columns: 320px 1fr; gap: 14px;
       <h2>Console command</h2>
       <div class="body">
         <form id="cmdform">
-          <input id="command" type="text" autocomplete="off" spellcheck="false"
+          <input id="command" type="text" autocomplete="off" spellcheck="false" aria-label="Console command"
                  placeholder='e.g. say hello, or op Somebody'>
           <button id="run" type="submit">Run</button>
         </form>
-        <div id="response"></div>
+        <div id="response" aria-live="polite"></div>
         <div class="hint">Executed on the server console through RCON.
         &uarr;/&darr; recall previous commands. The command also lands in the
         console feed below.</div>
@@ -469,15 +519,30 @@ const TOKEN_REQUIRED = __TOKEN_REQUIRED__;
 let token = TOKEN_REQUIRED ? (sessionStorage.getItem("panelToken") || "") : "";
 let lastSeq = -1;
 const history = [];
-let historyIndex = -1;
+let historyIndex = 0;
+let historyDraft = "";
+let statePollInFlight = false;
+let chatPollInFlight = false;
+let stateReqSeq = 0;
+let stateAppliedSeq = 0;
+let commandInFlight = false;
+let isOnline = false;
 
 const $ = (id) => document.getElementById(id);
+$("run").disabled = true;
 
 async function api(path, opts = {}) {
   const headers = { "Content-Type": "application/json" };
   if (token) headers["X-Panel-Token"] = token;
   const r = await fetch(path, Object.assign({}, opts, { headers }));
-  if (r.status === 401) { showLogin(); throw new Error("unauthorized"); }
+  if (r.status === 401) {
+    if (TOKEN_REQUIRED) {
+      token = "";
+      sessionStorage.removeItem("panelToken");
+    }
+    showLogin();
+    throw new Error("unauthorized");
+  }
   if (!r.ok) {
     let msg = String(r.status);
     try { msg = (await r.json()).error || msg; } catch (e) { /* keep status */ }
@@ -488,25 +553,38 @@ async function api(path, opts = {}) {
 
 function showLogin() {
   const box = $("login");
-  if (box) box.style.display = "flex";
+  if (!box) return;
+  box.style.display = "flex";
+  const input = $("tokeninput");
+  if (input) input.focus();
 }
 
 async function pollState() {
+  if (TOKEN_REQUIRED && !token) return;
+  if (statePollInFlight) return;
+  statePollInFlight = true;
+  const reqSeq = ++stateReqSeq;
   try {
     const s = await api("/api/state");
+    if (reqSeq < stateAppliedSeq) return;
+    stateAppliedSeq = reqSeq;
+    isOnline = !!s.online;
     const pill = $("status");
-    pill.textContent = s.online
+    pill.textContent = isOnline
       ? "online \u2014 " + s.player_count + "/" + s.max_players + " players"
       : "offline";
-    pill.className = "pill " + (s.online ? "online" : "offline");
-    pill.title = s.last_error || (s.online ? "" : "server container stopped");
-    $("run").disabled = !s.online;
+    pill.className = "pill " + (isOnline ? "online" : "offline");
+    pill.title = s.last_error || (isOnline ? "" : "server container stopped");
+    if (!commandInFlight) $("run").disabled = !isOnline;
+    $("state-error").textContent = "";
     const ul = $("players");
     ul.innerHTML = "";
     if (!s.players.length) {
       const li = document.createElement("li");
       li.className = "empty";
-      li.textContent = s.online ? "no players online" : "server is offline";
+      li.textContent = isOnline
+        ? (s.player_count > 0 ? s.player_count + " players online (names unavailable)" : "no players online")
+        : "server is offline";
       ul.appendChild(li);
     } else {
       for (const name of s.players) {
@@ -516,7 +594,10 @@ async function pollState() {
       }
     }
   } catch (e) {
-    // Keep the last known state; the next poll retries.
+    const msg = String(e && e.message ? e.message : e);
+    if (msg !== "unauthorized") $("state-error").textContent = "state: " + msg;
+  } finally {
+    statePollInFlight = false;
   }
 }
 
@@ -550,6 +631,9 @@ function appendEntries(entries) {
 }
 
 async function pollChat() {
+  if (TOKEN_REQUIRED && !token) return;
+  if (chatPollInFlight) return;
+  chatPollInFlight = true;
   try {
     const c = await api("/api/chat?after=" + lastSeq);
     if (c.latest < lastSeq) {
@@ -564,17 +648,33 @@ async function pollChat() {
       lastSeq = c.latest;
     }
   } catch (e) {
-    // Retry on the next tick.
+    const msg = String(e && e.message ? e.message : e);
+    if (msg !== "unauthorized" && !$("state-error").textContent) {
+      $("state-error").textContent = "chat: " + msg;
+    }
+  } finally {
+    chatPollInFlight = false;
   }
+}
+
+function pushHistory(cmd) {
+  if (!history.length || history[history.length - 1] !== cmd) history.push(cmd);
+  if (history.length > 200) history.shift();
+  historyIndex = history.length;
+  historyDraft = "";
 }
 
 $("cmdform").addEventListener("submit", async (ev) => {
   ev.preventDefault();
-  const cmd = $("command").value;
-  if (!cmd.trim()) return;
-  history.push(cmd);
-  historyIndex = history.length;
+  if (commandInFlight) return;
+  const input = $("command");
+  const cmd = input.value.trim();
+  if (!cmd) return;
   const out = $("response");
+  const run = $("run");
+  commandInFlight = true;
+  run.disabled = true;
+  input.disabled = true;
   out.className = "";
   out.textContent = "\u2026";
   try {
@@ -582,27 +682,34 @@ $("cmdform").addEventListener("submit", async (ev) => {
       method: "POST",
       body: JSON.stringify({ command: cmd })
     });
+    pushHistory(cmd);
+    input.value = "";
     out.textContent = r.response || "(no output)";
   } catch (e) {
     out.className = "error";
     out.textContent = String(e.message || e);
+  } finally {
+    commandInFlight = false;
+    input.disabled = false;
+    run.disabled = !isOnline;
+    input.focus();
   }
 });
 
 $("command").addEventListener("keydown", (ev) => {
   if (ev.key === "ArrowUp") {
-    if (historyIndex > 0) {
-      historyIndex -= 1;
-      $("command").value = history[historyIndex];
-      ev.preventDefault();
-    }
+    if (!history.length) return;
+    if (historyIndex === history.length) historyDraft = $("command").value;
+    if (historyIndex > 0) historyIndex -= 1;
+    $("command").value = history[historyIndex];
+    ev.preventDefault();
   } else if (ev.key === "ArrowDown") {
     if (historyIndex < history.length - 1) {
       historyIndex += 1;
       $("command").value = history[historyIndex];
-    } else {
+    } else if (historyIndex === history.length - 1) {
       historyIndex = history.length;
-      $("command").value = "";
+      $("command").value = historyDraft;
     }
     ev.preventDefault();
   }
@@ -613,6 +720,7 @@ if (TOKEN_REQUIRED) {
   $("loginform").addEventListener("submit", (ev) => {
     ev.preventDefault();
     token = $("tokeninput").value.trim();
+    if (!token) return;
     if (token) sessionStorage.setItem("panelToken", token);
     $("login").style.display = "none";
     pollState();
@@ -680,6 +788,23 @@ class Handler(BaseHTTPRequestHandler):
         self._send_body(code, json.dumps(obj, separators=(",", ":")).encode(),
                         "application/json")
 
+    def _send_no_content(self, code):
+        self.send_response(code)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Allow", "GET, POST, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _send_method_not_allowed(self):
+        self.send_response(405)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Allow", "GET, POST, OPTIONS")
+        self.send_header("Cache-Control", "no-store")
+        body = b'{"error":"method not allowed"}'
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         parts = urlsplit(self.path)
     
@@ -717,6 +842,10 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
+        if length < 0:
+            return self._send_json(400, {"error": "invalid Content-Length"})
+        if length > MAX_REQUEST_BODY_BYTES:
+            return self._send_json(413, {"error": "request body too large"})
         raw = self.rfile.read(length) if length > 0 else b""
         try:
             body = json.loads(raw or b"{}")
@@ -734,8 +863,29 @@ class Handler(BaseHTTPRequestHandler):
         try:
             response = self.rcon.command(command)
         except Exception as exc:
+            self.rcon.close()
+            self.state.set_offline(str(exc) or "RCON failure")
             return self._send_json(503, {"error": str(exc) or "RCON failure"})
         return self._send_json(200, {"ok": True, "response": response})
+
+    def do_OPTIONS(self):
+        self._send_no_content(204)
+
+    def do_HEAD(self):
+        self.send_response(405)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Allow", "GET, POST, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_PUT(self):
+        self._send_method_not_allowed()
+
+    def do_DELETE(self):
+        self._send_method_not_allowed()
+
+    def do_PATCH(self):
+        self._send_method_not_allowed()
 
 
 def main():
